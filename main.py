@@ -9,6 +9,8 @@ from .jev import JevJudge
 from .participation import ParticipationGate
 from .platform_api import OneBotClient
 from .private_proactive import PrivateProactive
+from .private_status import format_time, render_status
+from .sessions import require_admin
 from .tasks import TaskService, proactive_enabled
 from .tools import (
     FutureTaskPlusTool,
@@ -22,7 +24,7 @@ from .tools import (
     "astrbot_plugin_krypton",
     "nagatoquin33",
     "氪：私聊日程启动、原生未来任务增强与可选 JEV 群聊参与判断",
-    "0.4.1",
+    "0.4.2",
 )
 class KryptonPlugin(Star):
     """注册会话工具，并使未来任务扩展服从原生能力开关。"""
@@ -68,6 +70,30 @@ class KryptonPlugin(Star):
         except Exception:
             logger.exception("私聊自主行动启动失败")
 
+    @filter.command("氪状态", alias={"krypton_status"})
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def private_proactive_status(self, event):
+        """查看私聊自动启动的等待、跳过原因与最近执行结果，仅管理员可用。"""
+        require_admin(event)
+        event.set_extra("krypton_private_diagnostic", True)
+        result = await self.private_proactive.get_status()
+        yield event.plain_result(render_status(result))
+
+    @filter.command("氪重置", alias={"krypton_reset"})
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def reset_private_proactive(self, event, qq: str = ""):
+        """重新开始一个已配置 QQ 的首次唤醒等待，仅管理员可用。"""
+        require_admin(event)
+        event.set_extra("krypton_private_diagnostic", True)
+        try:
+            result = await self.private_proactive.reset_wait(qq)
+            text = f"已重新等待 QQ {result['qq']}，预计唤醒：" + format_time(
+                result["deadline"], result["timezone"]
+            )
+        except ValueError as exc:
+            text = str(exc)
+        yield event.plain_result(text)
+
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=-100)
     async def judge_group_participation(self, event):
         """通过可选 JEV 筛选普通群消息，复用原生主 Agent。"""
@@ -78,6 +104,8 @@ class KryptonPlugin(Star):
     @filter.after_message_sent()
     async def remember_reply(self, event):
         """记录实际回复，更新接话冷却和私聊沉默时间。"""
+        if event.get_extra("krypton_private_diagnostic", False):
+            return
         self.participation.note_sent(event)
         try:
             await self.private_proactive.on_reply(event)

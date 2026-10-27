@@ -1,7 +1,7 @@
 name: astrbot_plugin_krypton
 display_name: 氪 · Krypton
 desc: 手动指定 QQ 启动自主联系日程，查询群活动并增强原生跨会话未来任务，可选 JEV 判断群聊参与时机。
-version: v0.4.1
+version: v0.4.2
 author: nagatoquin33
 repo: https://github.com/nagatoquin33/astrbot_plugin_krypton
 astrbot_version: '>=4.29.0.dev0,<5'

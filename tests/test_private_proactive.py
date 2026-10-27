@@ -172,6 +172,24 @@ async def test_pending_state_restores_and_missed_deadline_does_not_burst_on_rest
     assert len(await case.context.cron_manager.list_jobs("basic")) == 1
 
 
+@pytest.mark.parametrize("before, after", [(30, 1), (1, 30)])
+async def test_reload_recalculates_pending_wait_using_new_config(
+    private_case, before, after
+):
+    case = private_case
+    case.config["private_proactive_idle_minutes"] = before
+    original = case.service()
+    await original.on_message(case.event)
+    session = case.event.unified_msg_origin
+    started_at = original.states[session]["last_activity"]
+    await original.close()
+    case.config["private_proactive_idle_minutes"] = after
+    case.clock[0] += 10
+    restored = case.service()
+    await restored.start()
+    assert restored.states[session]["deadline"] == started_at + after * 60
+
+
 async def test_failed_agent_wakeup_is_consumed_and_never_replayed(private_case):
     case = private_case
     service = case.service()
@@ -423,3 +441,99 @@ async def test_multiple_onebot_accounts_require_explicit_selection(private_case)
     selected = case.service()
     await selected.start()
     assert list(selected.jobs) == ["second-account:FriendMessage:123456"]
+
+
+async def test_status_is_read_only_and_diagnostic_messages_do_not_reset_wait(
+    private_case,
+):
+    from astrbot_plugin_krypton.main import KryptonPlugin
+
+    case = private_case
+    plugin = KryptonPlugin(case.context, case.config)
+    service = case.service()
+    plugin.private_proactive = service
+    await service.on_message(case.event)
+    session = case.event.unified_msg_origin
+    before = copy.deepcopy(service.states[session])
+    persisted = copy.deepcopy(case.store)
+    case.event.plain_result = lambda text: text
+    replies = [text async for text in plugin.private_proactive_status(case.event)]
+    assert "预计首次唤醒" in replies[0]
+    case.clock[0] += 20
+    await plugin.observe_private_message(case.event)
+    await plugin.remember_reply(case.event)
+    assert service.states[session] == before
+    assert case.store == persisted
+    await plugin.terminate()
+
+
+@pytest.mark.parametrize("fails", [False, True])
+async def test_status_records_actual_agent_outcome(private_case, fails):
+    from astrbot_plugin_krypton.private_status import render_status
+
+    case = private_case
+    service = case.service()
+    await service.on_message(case.event)
+    if fails:
+        case.context.cron_manager._woke_main_agent.side_effect = RuntimeError(
+            "test-only-failure"
+        )
+    await case.context.cron_manager._run_job(
+        service.jobs[case.event.unified_msg_origin]
+    )
+    status = await service.get_status()
+    assert status["targets"][0]["status"] == ("failed" if fails else "no_followup")
+    text = render_status(status)
+    assert ("唤醒失败" if fails else "未发现后续未来任务") in text
+    assert "test-only-failure" not in text
+
+
+async def test_explicit_reset_rearms_consumed_round_using_current_config(private_case):
+    case = private_case
+    service = case.service()
+    await service.on_message(case.event)
+    session = case.event.unified_msg_origin
+    await case.context.cron_manager._run_job(service.jobs[session])
+    assert service.states[session]["consumed"]
+    case.config["private_proactive_idle_minutes"] = 1
+    case.clock[0] += 20
+    result = await service.reset_wait("123456")
+    assert result["deadline"] == case.clock[0] + 60
+    assert not service.states[session]["consumed"]
+    assert session in service.jobs
+
+
+async def test_reset_does_not_delete_or_duplicate_existing_future_task(private_case):
+    case = private_case
+    future = await create_future(case)
+    service = case.service()
+    with pytest.raises(ValueError, match="已有相关未来任务"):
+        await service.reset_wait("123456")
+    assert not service.jobs
+    assert await case.context.cron_manager.db.get_cron_job(future.job_id) is not None
+
+
+async def test_diagnostic_command_rejects_members_before_reading_status(private_case):
+    from astrbot_plugin_krypton.main import KryptonPlugin
+
+    case = private_case
+    plugin = KryptonPlugin(case.context, case.config)
+    plugin.private_proactive.get_status = AsyncMock()
+    case.event.role = "member"
+    with pytest.raises(PermissionError):
+        async for _ in plugin.private_proactive_status(case.event):
+            pass
+    plugin.private_proactive.get_status.assert_not_awaited()
+    await plugin.terminate()
+
+
+async def test_status_explains_target_native_capability_is_disabled(private_case):
+    from astrbot_plugin_krypton.private_status import render_status
+
+    case = private_case
+    case.native["provider_settings"] = {
+        "proactive_capability": {"add_cron_tools": False}
+    }
+    service = case.service()
+    await service.start()
+    assert "未启用原生主动型能力" in render_status(await service.get_status())
