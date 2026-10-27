@@ -1,0 +1,321 @@
+"""为手动指定的 QQ 在缺少未来任务时提供一次启动机会。"""
+
+import asyncio
+import time
+from datetime import UTC, datetime, timedelta
+from uuid import uuid4
+from zoneinfo import ZoneInfo
+
+from astrbot.api import logger
+from astrbot.core.cron.events import CronMessageEvent
+from astrbot.core.db.po import CronJob
+from astrbot.core.platform.message_type import MessageType
+
+from .tasks import task_metadata
+
+DEFAULT_GOAL = (
+    "当前目标私聊没有待执行的相关未来任务，本轮唤醒用于建立你自己的后续日程。"
+    "先用 future_task_plus 确认相关任务；如果已经有人安排则复用，不重复创建。"
+    "结合人设与当前私聊上下文，自己决定下次何时联系对方、聊什么或办什么事，"
+    "并实际调用 future_task_plus 创建未来任务，不要只口头说已安排，"
+    "也不要要求对方提醒你或替你创建任务。若对方明确要求停止主动联系，则遵守。"
+    "必要时可先调用其他工具了解情况，本轮不必立即发送私聊消息。"
+    "对方一直没有回复时，可以先查看群活动，再按需读取群聊现场；群活跃不代表对方在线。"
+    "只有需要向对方表达或分享的内容才发送，不要发送本轮检查报告。"
+)
+OWNER_KEY = "krypton_private_bootstrap"
+STATE_KEY = "private_proactive_state"
+
+
+class PrivateProactive:
+    def __init__(self, context, config, load, save, clock=time.time):
+        self.context = context
+        self.config = config
+        self.load, self.save, self.clock = load, save, clock
+        self.lock = asyncio.Lock()
+        self.states = {}
+        self.jobs = {}
+        self.running = {}
+        self.started = False
+        self.closed = False
+
+    def _targets(self):
+        raw_ids = self.config.get("private_proactive_qq_ids", []) or []
+        if not isinstance(raw_ids, list):
+            return {}
+        ids = {
+            str(int(text))
+            for raw in raw_ids
+            if (text := str(raw).strip()).isascii() and text.isdigit() and int(text) > 0
+        }
+        platform_id = str(
+            self.config.get("private_proactive_platform_id", "") or ""
+        ).strip()
+        platforms = [
+            p
+            for p in self.context.platform_manager.platform_insts
+            if p.meta().name == "aiocqhttp"
+            and p.meta().support_proactive_message
+            and (not platform_id or p.meta().id == platform_id)
+        ]
+        if len(platforms) != 1:
+            return {}
+        platform_id = platforms[0].meta().id
+        return {f"{platform_id}:FriendMessage:{qq}": qq for qq in sorted(ids)}
+
+    def _allowed(self, session, sender):
+        if self.closed or not self.config.get("enable_private_proactive", False):
+            return False
+        if self._targets().get(session) != str(sender):
+            return False
+        cfg = self.context.get_config(umo=session)
+        plugins = cfg.get("plugin_set", ["*"])
+        provider = cfg.get("provider_settings", {})
+        if (
+            "*" not in plugins and "astrbot_plugin_krypton" not in plugins
+        ) or not provider.get("enable", True):
+            return False
+        if not provider.get("proactive_capability", {}).get("add_cron_tools", True):
+            return False
+        return True
+
+    async def _has_future_task(self, session):
+        manager = self.context.cron_manager
+        for job in await manager.list_jobs("active_agent"):
+            payload = job.payload or {}
+            if session not in (
+                payload.get("session"),
+                task_metadata(payload).get("source_session"),
+            ):
+                continue
+            if job.status == "running":
+                return True
+            if not job.enabled:
+                continue
+            next_run = manager.get_next_run_time(job.job_id)
+            if next_run is not None and next_run.timestamp() >= self.clock():
+                return True
+        return False
+
+    def _deadline(self, session, after):
+        delay = (
+            max(1, float(self.config.get("private_proactive_idle_minutes", 30))) * 60
+        )
+        return self._outside_quiet(session, after + delay)
+
+    def _outside_quiet(self, session, deadline):
+        quiet = str(self.config.get("private_proactive_quiet_hours", "") or "").strip()
+        if not quiet:
+            return deadline
+        start, end = [
+            datetime.strptime(t.strip(), "%H:%M").time() for t in quiet.split("-", 1)
+        ]
+        cfg = self.context.get_config(umo=session)
+        tz = ZoneInfo(cfg.get("timezone") or "UTC")
+        local = datetime.fromtimestamp(deadline, UTC).astimezone(tz)
+        current = local.time()
+        in_quiet = (
+            start <= current < end if start < end else current >= start or current < end
+        )
+        if start != end and in_quiet:
+            day = local.date() + (
+                timedelta(days=1) if start > end and current >= start else timedelta()
+            )
+            deadline = datetime.combine(day, end, tzinfo=tz).timestamp()
+        return deadline
+
+    def _new_state(self, session, sender):
+        now = self.clock()
+        return {
+            "sender_id": str(sender),
+            "last_activity": now,
+            "deadline": self._deadline(session, now),
+            "token": uuid4().hex,
+            "consumed": False,
+        }
+
+    async def _schedule(self, session, state):
+        manager = self.context.cron_manager
+        old = self.jobs.pop(session, None)
+        if old:
+            await manager.delete_job(old)
+        payload = {
+            OWNER_KEY: True,
+            "session": session,
+            "token": state["token"],
+            "run_at": datetime.fromtimestamp(state["deadline"], UTC).isoformat(),
+        }
+        job = await manager.add_basic_job(
+            name="氪：私聊自主行动启动",
+            cron_expression="0 0 1 1 *",
+            handler=self._run,
+            payload=payload,
+            enabled=False,
+            persistent=False,
+            description="目标没有相关未来任务时，唤醒主 Agent 自主创建后续日程。",
+        )
+        try:
+            await manager.update_job(job.job_id, run_once=True, enabled=True)
+        except BaseException:
+            await manager.delete_job(job.job_id)
+            raise
+        self.jobs[session] = job.job_id
+
+    async def start(self):
+        async with self.lock:
+            if self.started or self.closed:
+                return
+            manager = self.context.cron_manager
+            if manager is None:
+                return
+            await manager.start(self.context)
+            self.states = await self.load(STATE_KEY, {}) or {}
+            # 原生不恢复无处理器的维护任务，重新按持久化状态注册本插件的一次性处理器。
+            for job in await manager.list_jobs("basic"):
+                if job.payload.get(OWNER_KEY) is True:
+                    await manager.delete_job(job.job_id)
+            if self.config.get("enable_private_proactive", False):
+                targets = self._targets()
+                if self.config.get("private_proactive_qq_ids") and not targets:
+                    logger.warning(
+                        "私聊启动未确定有效目标：请填写 QQ 号，并在多个 OneBot 账号时指定平台 ID。"
+                    )
+                self.states = {
+                    session: state
+                    for session, state in self.states.items()
+                    if session in targets
+                }
+                for session, sender in targets.items():
+                    if session not in self.states and self._allowed(session, sender):
+                        self.states[session] = self._new_state(session, sender)
+                for session, state in self.states.items():
+                    if not state["consumed"] and self._allowed(
+                        session, state["sender_id"]
+                    ):
+                        if await self._has_future_task(session):
+                            state["consumed"] = True
+                            continue
+                        if state["deadline"] <= self.clock():
+                            state["deadline"] = self._deadline(session, self.clock())
+                        else:
+                            state["deadline"] = self._outside_quiet(
+                                session, state["deadline"]
+                            )
+                        await self._schedule(session, state)
+                await self.save(STATE_KEY, self.states)
+            self.started = True
+
+    async def on_message(self, event):
+        if (
+            isinstance(event, CronMessageEvent)
+            or event.get_message_type() != MessageType.FRIEND_MESSAGE
+        ):
+            return
+        sender = str(event.get_sender_id())
+        if (
+            not sender
+            or sender == event.get_self_id()
+            or not self._allowed(event.unified_msg_origin, sender)
+        ):
+            return
+        await self.start()
+        async with self.lock:
+            if self.closed:
+                return
+            session = event.unified_msg_origin
+            running = self.running.get(session)
+            if running and running is not asyncio.current_task():
+                running.cancel()
+            state = self._new_state(session, sender)
+            self.states[session] = state
+            if await self._has_future_task(session):
+                state["consumed"] = True
+                old = self.jobs.pop(session, None)
+                if old:
+                    await self.context.cron_manager.delete_job(old)
+                await self.save(STATE_KEY, self.states)
+                return
+            await self.save(STATE_KEY, self.states)
+            await self._schedule(session, state)
+
+    async def on_reply(self, event):
+        if isinstance(event, CronMessageEvent):
+            return
+        session = event.unified_msg_origin
+        state = self.states.get(session)
+        if state is not None and not state["consumed"]:
+            await self.on_message(event)
+
+    async def _run(self, session, token, **kwargs):
+        current = asyncio.current_task()
+        async with self.lock:
+            state = self.states.get(session)
+            if (
+                state is None
+                or state["token"] != token
+                or state["consumed"]
+                or not self._allowed(session, state["sender_id"])
+            ):
+                return
+            if await self._has_future_task(session):
+                state["consumed"] = True
+                self.jobs.pop(session, None)
+                await self.save(STATE_KEY, self.states)
+                return
+            allowed_at = self._outside_quiet(session, self.clock())
+            if allowed_at > self.clock():
+                state["deadline"] = allowed_at
+                await self.save(STATE_KEY, self.states)
+                await self._schedule(session, state)
+                return
+            # 先落下已启动状态，异常或发送结果未知时不自动重放本轮。
+            state["consumed"] = True
+            await self.save(STATE_KEY, self.states)
+            job_id = self.jobs.pop(session, None)
+            self.running[session] = current
+            goal = (
+                str(self.config.get("private_proactive_goal", "") or "").strip()
+                or DEFAULT_GOAL
+            )
+            note = (
+                goal
+                + "\n\n本轮等待起点（配置启动或最近一次私聊活动）："
+                + datetime.fromtimestamp(state["last_activity"], UTC).isoformat()
+            )
+            job = CronJob(
+                job_id=job_id or uuid4().hex,
+                name="私聊自主行动机会",
+                job_type="active_agent",
+                run_once=True,
+                payload={
+                    "session": session,
+                    "sender_id": state["sender_id"],
+                    "origin": "tool",
+                    "note": note,
+                    "krypton": {"private_bootstrap": True},
+                },
+            )
+        try:
+            # 复用本体构建主 Agent、加载目标历史、调用工具与保存结果的完整链路。
+            await self.context.cron_manager._run_active_agent_job(
+                job, start_time=datetime.now(UTC)
+            )
+        finally:
+            if self.running.get(session) is current:
+                self.running.pop(session, None)
+
+    async def close(self):
+        async with self.lock:
+            self.closed = True
+            for job_id in self.jobs.values():
+                await self.context.cron_manager.delete_job(job_id)
+            self.jobs.clear()
+            tasks = [
+                task
+                for task in self.running.values()
+                if task is not asyncio.current_task()
+            ]
+            for task in tasks:
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)

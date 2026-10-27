@@ -1,4 +1,45 @@
 {
+  "enable_private_proactive": {
+    "description": "启用私聊主动联系",
+    "type": "bool",
+    "default": false,
+    "hint": "只对手动填写的 QQ 生效。目标没有待执行或运行中的相关未来任务时，等待后兜底唤醒主 Agent 一次，让它自行创建后续任务；已有任务时不重复唤醒。不依赖 JEV。"
+  },
+  "private_proactive_qq_ids": {
+    "description": "主动联系的 QQ 号",
+    "type": "list",
+    "default": [],
+    "condition": {"enable_private_proactive": true},
+    "hint": "手动添加目标 QQ 号，只填数字，不需要填写 UMO。空列表不联系任何人，也不会自动添加管理员。通过已连接的 OneBot 账号发起私聊。"
+  },
+  "private_proactive_platform_id": {
+    "description": "私聊使用的 OneBot 平台 ID",
+    "type": "string",
+    "default": "",
+    "condition": {"enable_private_proactive": true},
+    "hint": "只有一个 OneBot 账号时留空自动选择。多个账号时必须指定，与 /sid 返回值第一个字段一致，避免通过多个账号重复联系。"
+  },
+  "private_proactive_idle_minutes": {
+    "description": "首次唤醒等待时间（分钟）",
+    "type": "int",
+    "default": 30,
+    "condition": {"enable_private_proactive": true},
+    "hint": "配置启动或普通私聊后等待的时间，新消息或正常回复会重置等待。等待到点会再次确认目标没有相关未来任务，再提供一次启动机会；后续交给模型建立的未来任务。"
+  },
+  "private_proactive_quiet_hours": {
+    "description": "私聊主动联系免打扰时段",
+    "type": "string",
+    "default": "",
+    "condition": {"enable_private_proactive": true},
+    "hint": "可选，如 23:00-08:00，按目标会话时区推迟首次自动启动。留空不限制；不改变模型或用户已经建立的其他未来任务。"
+  },
+  "private_proactive_goal": {
+    "description": "自动唤醒时的行动需求",
+    "type": "text",
+    "default": "",
+    "condition": {"enable_private_proactive": true},
+    "hint": "留空使用内置需求：确认相关任务，自己决定下一次联系的时间与行动，并实际调用未来任务工具创建日程；不必立即发消息。仅作为本轮任务需求，不修改普通聊天提示词。"
+  },
   "enable_jev": {
     "description": "启用 JEV 群聊参与判断",
     "type": "bool",
