@@ -153,6 +153,111 @@ async def test_invalid_create_does_not_persist(context, event, arguments):
     assert await context.cron_manager.list_jobs() == []
 
 
+async def test_contact_metadata_inherits_from_bootstrap_and_records_timing_reason(
+    context, event
+):
+    event.unified_msg_origin = "test:FriendMessage:owner"
+    cron = CronMessageEvent(
+        context=context,
+        session=MessageSession.from_str(event.unified_msg_origin),
+        message="建立后续日程",
+        extras={
+            "cron_payload": {
+                "sender_id": "owner",
+                "krypton": {
+                    "private_bootstrap": True,
+                    "contact_session": event.unified_msg_origin,
+                },
+            }
+        },
+    )
+    cron.role = "admin"
+    service = TaskService(context)
+    result = await service.execute(
+        cron,
+        "create",
+        note="看完电影后聊聊",
+        run_at=future_time(),
+        timing_reason="预计两小时后看完电影",
+    )
+    task = result["task"]
+    assert (
+        task["intent"] == "contact" and task["timing_reason"] == "预计两小时后看完电影"
+    )
+    row = await context.get_db().get_cron_job(task["job_id"])
+    assert row.payload["krypton"]["contact_session"] == event.unified_msg_origin
+    assert row.payload["krypton"]["managed_private"]
+    assert row.payload["note"] == "看完电影后聊聊"
+    normal = await service.execute(
+        cron, "create", intent="task", note="明确的普通提醒", run_at=future_time()
+    )
+    row = await context.get_db().get_cron_job(normal["task"]["job_id"])
+    assert "contact_session" not in row.payload["krypton"]
+
+
+async def test_multihop_contact_followup_stays_visible_from_original_private_session(
+    context, event
+):
+    event.unified_msg_origin = "test:FriendMessage:owner"
+    service = TaskService(context)
+    first = await service.execute(
+        event,
+        "create",
+        intent="contact",
+        session="test:GroupMessage:one",
+        note="去群里联系",
+        run_at=future_time(),
+    )
+    row = await context.get_db().get_cron_job(first["task"]["job_id"])
+    cron = CronMessageEvent(
+        context=context,
+        session=MessageSession.from_str("test:GroupMessage:one"),
+        message="继续跟进",
+        extras={"cron_payload": row.payload},
+    )
+    cron.role = "admin"
+    second = await service.execute(
+        cron,
+        "create",
+        session="test:GroupMessage:two",
+        note="换一个群继续",
+        run_at=future_time(),
+    )
+    await service.execute(event, "delete", job_id=first["task"]["job_id"])
+    result = await service.execute(event, "list")
+    assert result["total"] == 1
+    assert result["tasks"][0]["job_id"] == second["task"]["job_id"]
+    assert result["tasks"][0]["contact_session"] == event.unified_msg_origin
+
+
+async def test_timing_reason_survives_non_timing_edit_and_is_cleared_when_time_changes(
+    context, event
+):
+    service = TaskService(context)
+    created = await service.execute(
+        event,
+        "create",
+        intent="contact",
+        timing_reason="等对方忙完",
+        note="稍后联系",
+        run_at=future_time(),
+    )
+    job_id = created["task"]["job_id"]
+    assert (await service.execute(event, "edit", job_id=job_id, name="修改名称"))[
+        "task"
+    ]["timing_reason"] == "等对方忙完"
+    changed = await service.execute(
+        event,
+        "edit",
+        job_id=job_id,
+        run_at=(datetime.now(UTC) + timedelta(days=366)).isoformat(),
+    )
+    assert changed["task"]["timing_reason"] == ""
+    assert (
+        await service.execute(event, "edit", job_id=job_id, timing_reason="改为明天")
+    )["task"]["timing_reason"] == "改为明天"
+
+
 async def test_invalid_edit_does_not_replace_existing_schedule(context, event):
     service = TaskService(context)
     job_id = (

@@ -103,3 +103,90 @@ def onebot(context):
         None,
     )
     return platform, state
+
+
+@pytest.fixture
+def contact_case(context, onebot, event):
+    import copy
+
+    from astrbot.core.cron.events import CronMessageEvent
+    from astrbot.core.platform.message_session import MessageSession
+    from astrbot_plugin_krypton.contact_delivery import ContactRuntime
+
+    session = "custom-account:FriendMessage:123456"
+    settings = {
+        "enable": True,
+        "regex": r".*?[。？！]+|.+$",
+        "interval": "0,0",
+        "words_count_threshold": 150,
+    }
+    context.get_config = lambda umo=None: {
+        "platform_settings": {"segmented_reply": settings}
+    }
+    store = {}
+
+    async def load(key, default):
+        return copy.deepcopy(store.get(key, default))
+
+    async def save(key, value):
+        store[key] = copy.deepcopy(value)
+
+    async def hook(*args):
+        return False
+
+    private = SimpleNamespace(
+        _targets=lambda: {session: "123456"},
+        _allowed=lambda *args: True,
+        _outside_quiet=lambda session, now: now,
+    )
+    runtime = ContactRuntime(
+        context,
+        {"enable_private_proactive": True},
+        load,
+        save,
+        private,
+        hook=hook,
+        sleep=AsyncMock(),
+    )
+    actual_send = context.send_message
+
+    def cron(intent="contact", owner=session):
+        msg = CronMessageEvent(
+            context=context,
+            session=MessageSession.from_str(session),
+            message="自主联系",
+            extras={
+                "cron_payload": {
+                    "sender_id": "123456",
+                    "krypton": {"intent": intent, "contact_session": owner},
+                }
+            },
+            message_type=MessageType.FRIEND_MESSAGE,
+        )
+        msg.role = "admin"
+        return msg
+
+    def incoming(umo=session, sender="123456"):
+        result = copy.copy(event)
+        result.unified_msg_origin = umo
+        result.get_sender_id = lambda: sender
+        result.get_self_id = lambda: "bot"
+        result.get_message_type = lambda: MessageSession.from_str(umo).message_type
+        return result
+
+    async def begin(msg):
+        wrapper = SimpleNamespace(context=SimpleNamespace(context=context, event=msg))
+        await runtime.begin(msg, wrapper)
+        return wrapper
+
+    return SimpleNamespace(
+        context=context,
+        runtime=runtime,
+        store=store,
+        session=session,
+        settings=settings,
+        actual_send=actual_send,
+        cron=cron,
+        incoming=incoming,
+        begin=begin,
+    )

@@ -50,6 +50,8 @@ def render_status(result):
             lines.append(
                 "下次执行：" + format_time(future["next_run"], row["timezone"])
             )
+            if future.get("timing_reason"):
+                lines.append("择时依据：" + future["timing_reason"])
         elif row["status"] == "waiting":
             if row["next_run"] is None:
                 lines.append("等待项尚未注册，请重载插件检查日志。")
@@ -61,6 +63,40 @@ def render_status(result):
             lines.append(labels.get(row["status"], row["status"]))
         if row["last_error"]:
             lines.append("最近错误类型：" + row["last_error"])
+        contact = row.get("contact")
+        if contact:
+            lines.append(
+                "连续未回复联系：" + str(contact.get("unanswered_contacts", 0)) + " 轮"
+            )
+            if contact.get("last_result"):
+                result = contact["last_result"]
+                label = {
+                    "sent": "已送达",
+                    "partial": "部分送达",
+                    "unknown": "结果未知",
+                    "cancelled": "已停止",
+                    "silent": "未发送",
+                    "failed": "未送达",
+                }.get(result["status"], result["status"])
+                lines.append(f"最近发送：{label}，已确认 {result['sent_parts']} 段")
+                if result.get("reason"):
+                    lines.append("停止原因：" + result["reason"])
+                followup = row.get("followup", {})
+                state = followup.get("state")
+                if state == "scheduled":
+                    when = datetime.fromisoformat(followup["next_run_time"]).timestamp()
+                    lines.append("下次主动联系：" + format_time(when, row["timezone"]))
+                elif state:
+                    lines.append(
+                        "后续联系："
+                        + {
+                            "none": "暂未安排，是否续建由模型决定",
+                            "paused": "已有联系任务，但已暂停",
+                            "running": "其他联系任务正在执行",
+                            "unscheduled": "任务仍在但未注册调度，请检查未来任务错误",
+                            "unavailable": "调度器尚未就绪",
+                        }.get(state, state)
+                    )
     lines.extend(
         [
             "",

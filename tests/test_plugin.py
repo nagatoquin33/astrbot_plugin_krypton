@@ -24,6 +24,7 @@ async def test_request_prefers_enhanced_tool_without_modifying_global_builtin(
         "list_chat_sessions",
         "get_chat_context",
         "get_group_activity",
+        "get_contact_state",
     }
     native = FunctionTool(
         name="future_task", description="native", parameters={"type": "object"}

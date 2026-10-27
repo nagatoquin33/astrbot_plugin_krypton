@@ -4,6 +4,8 @@ from datetime import UTC, datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from astrbot.core.db.po import CronJob
+from astrbot.core.platform.message_session import MessageSession
+from astrbot.core.platform.message_type import MessageType
 
 from .sessions import require_admin, resolve_session, sender_id
 
@@ -41,8 +43,14 @@ def proactive_enabled(context, event) -> bool:
 class TaskService:
     """封装任务操作及会话、创建者权限。"""
 
-    def __init__(self, context):
+    def __init__(self, context, contact_runtime=None):
         self.context = context
+        self.contact_runtime = contact_runtime
+
+    async def _guard_contact(self, event):
+        turn = event.get_extra("krypton_contact_turn")
+        if turn and self.contact_runtime is not None:
+            await self.contact_runtime.guard(turn, for_task=True)
 
     def _allowed(self, event, job) -> bool:
         """判断是否可管理此 Agent 任务。
@@ -97,6 +105,14 @@ class TaskService:
                 "instruction", payload.get("note") or job.description
             ),
             "background": plugin_data.get("background", plugin_data.get("context", "")),
+            "intent": plugin_data.get("intent", "task"),
+            "timing_reason": plugin_data.get("timing_reason", ""),
+            "decided_at": plugin_data.get("decided_at"),
+            **(
+                {"contact_session": plugin_data.get("contact_session")}
+                if plugin_data.get("intent") == "contact"
+                else {}
+            ),
             "cron_expression": job.cron_expression,
             "run_once": job.run_once,
             "run_at": payload.get("run_at"),
@@ -152,7 +168,14 @@ class TaskService:
                 if (
                     not target
                     and scope == "current"
-                    and current not in (payload.get("session"), source)
+                    and current
+                    not in (
+                        payload.get("session"),
+                        source,
+                        task_metadata(payload).get("contact_session")
+                        if task_metadata(payload).get("intent") == "contact"
+                        else None,
+                    )
                 ):
                     continue
                 jobs.append(job)
@@ -201,6 +224,8 @@ class TaskService:
                             raise ValueError(
                                 "一次性任务时间已过，请先用 edit 设置未来的 run_at。"
                             )
+                if action == "resume":
+                    await self._guard_contact(event)
                 job = await manager.update_job(job_id, enabled=action == "resume")
                 return {"action": action, "task": self._describe(manager, job)}
             if not any(
@@ -214,6 +239,8 @@ class TaskService:
                     "cron_expression",
                     "run_once",
                     "timezone",
+                    "intent",
+                    "timing_reason",
                 )
             ):
                 raise ValueError("edit 至少需要一个要修改的字段。")
@@ -282,6 +309,49 @@ class TaskService:
             background=background,
             source_session=plugin_data.get("source_session") or current,
         )
+        parent = task_metadata(event.get_extra("cron_payload", {}) or {})
+        inherited_contact = parent.get("intent") == "contact" or parent.get(
+            "private_bootstrap"
+        )
+        intent = kwargs.get(
+            "intent",
+            plugin_data.get(
+                "intent", "contact" if not job and inherited_contact else "task"
+            ),
+        )
+        if intent not in {"task", "contact"}:
+            raise ValueError("intent 只能是 task 或 contact。")
+        timing_changed = any(
+            key in kwargs for key in ("run_at", "cron_expression", "timezone")
+        )
+        reason = str(
+            kwargs.get(
+                "timing_reason",
+                "" if timing_changed else plugin_data.get("timing_reason", ""),
+            )
+            or ""
+        ).strip()[:1000]
+        plugin_data.update(intent=intent, timing_reason=reason)
+        if not job or timing_changed or "timing_reason" in kwargs:
+            plugin_data["decided_at"] = datetime.now(UTC).isoformat()
+        if intent == "contact":
+            owner = plugin_data.get("contact_session") or parent.get("contact_session")
+            if not owner:
+                owner = (
+                    target
+                    if MessageSession.from_str(target).message_type
+                    == MessageType.FRIEND_MESSAGE
+                    else current
+                )
+            plugin_data["contact_session"] = owner
+            plugin_data["managed_private"] = bool(
+                plugin_data.get("managed_private")
+                or parent.get("managed_private")
+                or parent.get("private_bootstrap")
+            )
+        else:
+            plugin_data.pop("contact_session", None)
+            plugin_data.pop("managed_private", None)
         source_session = plugin_data["source_session"]
         payload.update(
             session=target,
@@ -309,6 +379,7 @@ class TaskService:
         )
         # 原生创建接口先落库再校验；先复用其校验器，防止无效日程留下脏记录。
         manager._build_trigger(candidate)
+        await self._guard_contact(event)
         if job:
             job = await manager.update_job(
                 job.job_id,

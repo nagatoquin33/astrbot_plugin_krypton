@@ -1,4 +1,10 @@
 {
+  "contact_segmented_reply": {
+    "description": "主动联系跟随本体分段设置",
+    "type": "bool",
+    "default": true,
+    "hint": "只作用于标记为 contact 的自主联系任务。使用目标会话本体分段设置；标准装饰/分段插件已经发送前几段时，不再二次切分剩余段。普通提醒和业务任务保持原有流程。"
+  },
   "enable_private_proactive": {
     "description": "启用私聊主动联系",
     "type": "bool",

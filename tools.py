@@ -1,8 +1,9 @@
 """插件提供给模型的会话查询和未来任务工具。"""
 
 import json
+from datetime import UTC, datetime
 from typing import Any
-from zoneinfo import ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from astrbot.api import FunctionTool, logger
 from astrbot.core.cron.manager import CronJobSchedulingError
@@ -10,7 +11,8 @@ from pydantic import Field
 from pydantic.dataclasses import dataclass
 
 from .chat_context import get_chat_context
-from .sessions import list_sessions
+from .contact_tasks import contact_schedule
+from .sessions import list_sessions, require_admin, resolve_session
 
 
 @dataclass
@@ -87,6 +89,11 @@ class FutureTaskPlusTool(FunctionTool):
         "需要结合群里现场决定怎样开口时，执行阶段可用 get_chat_context 查询近期消息；不要把创建时的背景当成实时动态。"
         "如果想主动发起话题、跟进对方或之后再联系，可以自主安排下一次未来任务；到时依据实际情况决定是否行动和使用哪些工具。"
         "私聊一直没有回应时，可先用 get_group_activity 比较已知群的新消息，再按需查看群聊现场，决定是否联系；不要把群活跃当成对方一定在线。"
+        "自主联系使用 intent=contact，并用 timing_reason 说明为何选择这个时间；普通提醒和业务任务使用 task。"
+        "结合对方最新状态决定时间；对方说休息、忙碌或稍后联系时，先查已有 contact 任务并修改合适的原任务。"
+        "对方明确要求停止主动联系时，检查并暂停或删除相关 contact 任务，保留普通提醒与业务任务。"
+        "返回的 contact_session 是联系对象，跨群跟进仍按它关联管理。"
+        "执行主动联系前可用 get_contact_state 查看真实未回复轮次，不要把未回复直接解释成已读或情绪。"
     )
     parameters: dict = Field(
         default_factory=lambda: {
@@ -116,6 +123,15 @@ class FutureTaskPlusTool(FunctionTool):
                 "background": {
                     "type": "string",
                     "description": "可选，概括来源会话发生了什么、为什么联系目标、希望传达或行动的方向，以及必要进度与条件。目标会话不知道来源现场，不要用‘刚才那件事’等不明指代。不要填无关聊天或凭据。",
+                },
+                "intent": {
+                    "type": "string",
+                    "enum": ["task", "contact"],
+                    "description": "task 为普通提醒/业务任务（默认）；contact 为自主联系，使用联系状态和分段发送。自主联系任务内创建的后续任务默认继承 contact。",
+                },
+                "timing_reason": {
+                    "type": "string",
+                    "description": "可选，选择执行时间的具体语境依据，如对方预计两小时后看完电影。修改时间时请同步更新，避免沿用旧理由。",
                 },
                 "session": {
                     "type": "string",
@@ -186,6 +202,7 @@ class GetChatContextTool(FunctionTool):
     plugin_context: Any = None
     platform_client: Any = None
     activity: Any = None
+    contact_runtime: Any = None
     name: str = "get_chat_context"
     description: str = (
         "查看指定群聊/私聊近期消息，用于跨会话主动发言或未来任务执行前了解现场。"
@@ -235,6 +252,10 @@ class GetChatContextTool(FunctionTool):
                 client=self.platform_client,
                 activity=self.activity,
             )
+            if self.contact_runtime is not None and "error" not in result:
+                await self.contact_runtime.context_viewed(
+                    context.context.event, session
+                )
         except (ValueError, TypeError, PermissionError) as exc:
             return json.dumps({"error": str(exc)}, ensure_ascii=False)
         except Exception as exc:
@@ -243,6 +264,75 @@ class GetChatContextTool(FunctionTool):
                 {"error": f"目标会话消息查询失败：{exc}"}, ensure_ascii=False
             )
         return json.dumps(result, ensure_ascii=False)
+
+
+@dataclass
+class GetContactStateTool(FunctionTool):
+    runtime: Any = None
+    name: str = "get_contact_state"
+    description: str = (
+        "查询主动联系的真实状态：最近收到用户消息的时间、最近成功联系、连续未回复轮次、最近发送结果和已观察到的群发言。"
+        "一轮的多段消息只算一次联系；未回复不代表已读，群发言不代表当前在线。"
+        "同时返回后续联系日程，区分已安排、运行中、已暂停、失去调度和未安排；当前执行任务不算自己的后续。"
+        "群聊计数在有新发言时重置，不代表新消息一定是在回应助手。"
+        "省略 session 时使用当前主动联系的对象，否则使用当前会话。跨会话查询仅限管理员。"
+    )
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "session": {"type": "string", "description": "可选，真实完整会话 UMO。"}
+            },
+        }
+    )
+
+    async def call(self, context, session: str = "") -> str:
+        event = context.context.event
+        turn = event.get_extra("krypton_contact_turn")
+        target = session.strip() or (turn.owner if turn else event.unified_msg_origin)
+        try:
+            if target != event.unified_msg_origin:
+                require_admin(event)
+            resolve_session(self.runtime.context, target)
+            facts = await self.runtime.state.facts(target)
+            facts["followup"] = await contact_schedule(
+                self.runtime.context,
+                target,
+                event.get_extra("cron_job", {}).get("id", ""),
+            )
+            try:
+                tz = ZoneInfo(
+                    self.runtime.context.get_config(umo=event.unified_msg_origin).get(
+                        "timezone"
+                    )
+                    or "UTC"
+                )
+            except ZoneInfoNotFoundError:
+                tz = UTC
+            for key in ("last_user_at", "last_contact_at", "last_delivery_at"):
+                if key in facts:
+                    facts[key] = (
+                        datetime.fromtimestamp(facts[key], UTC)
+                        .astimezone(tz)
+                        .isoformat(timespec="seconds")
+                    )
+            for key in ("last_seen_group", "last_result"):
+                if facts.get(key):
+                    facts[key]["time"] = (
+                        datetime.fromtimestamp(facts[key]["time"], UTC)
+                        .astimezone(tz)
+                        .isoformat(timespec="seconds")
+                    )
+            facts["current_time"] = datetime.now(tz).isoformat(timespec="seconds")
+            if facts["followup"].get("next_run_time"):
+                facts["followup"]["next_run_time"] = (
+                    datetime.fromisoformat(facts["followup"]["next_run_time"])
+                    .astimezone(tz)
+                    .isoformat(timespec="seconds")
+                )
+            return json.dumps(facts, ensure_ascii=False)
+        except (PermissionError, ValueError, TypeError) as exc:
+            return json.dumps({"error": str(exc)}, ensure_ascii=False)
 
 
 @dataclass

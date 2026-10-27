@@ -5,6 +5,7 @@ from astrbot.api.event import filter
 from astrbot.api.star import Context, Star, register
 
 from .activity import GroupActivity
+from .contact_delivery import ContactRuntime
 from .jev import JevJudge
 from .participation import ParticipationGate
 from .platform_api import OneBotClient
@@ -15,6 +16,7 @@ from .tasks import TaskService, proactive_enabled
 from .tools import (
     FutureTaskPlusTool,
     GetChatContextTool,
+    GetContactStateTool,
     GetGroupActivityTool,
     ListChatSessionsTool,
 )
@@ -24,7 +26,7 @@ from .tools import (
     "astrbot_plugin_krypton",
     "nagatoquin33",
     "氪：私聊日程启动、原生未来任务增强与可选 JEV 群聊参与判断",
-    "0.4.2",
+    "0.5.0",
 )
 class KryptonPlugin(Star):
     """注册会话工具，并使未来任务扩展服从原生能力开关。"""
@@ -36,7 +38,15 @@ class KryptonPlugin(Star):
         self.private_proactive = PrivateProactive(
             context, self.plugin_config, self.get_kv_data, self.put_kv_data
         )
-        self.service = TaskService(context)
+        self.contacts = ContactRuntime(
+            context,
+            self.plugin_config,
+            self.get_kv_data,
+            self.put_kv_data,
+            self.private_proactive,
+        )
+        self.private_proactive.contact_state = self.contacts.state
+        self.service = TaskService(context, contact_runtime=self.contacts)
         self.platform_client = OneBotClient()
         self.activity = GroupActivity(
             context, self.platform_client, self.get_kv_data, self.put_kv_data
@@ -47,12 +57,15 @@ class KryptonPlugin(Star):
                 plugin_context=context,
                 platform_client=self.platform_client,
                 activity=self.activity,
+                contact_runtime=self.contacts,
             ),
+            GetContactStateTool(runtime=self.contacts),
             GetGroupActivityTool(activity=self.activity),
             FutureTaskPlusTool(service=self.service),
         )
 
     async def initialize(self):
+        await self.contacts.initialize()
         if getattr(self.context, "cron_manager", None) is not None and hasattr(
             self.context.cron_manager, "ctx"
         ):
@@ -60,12 +73,14 @@ class KryptonPlugin(Star):
 
     @filter.on_astrbot_loaded()
     async def restore_private_proactive(self):
+        await self.contacts.initialize()
         await self.private_proactive.start()
 
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE, priority=-100)
     async def observe_private_message(self, event):
         """普通私聊即可启动沉默等待，不要求用户先提出创建任务。"""
         try:
+            await self.contacts.observe(event)
             await self.private_proactive.on_message(event)
         except Exception:
             logger.exception("私聊自主行动启动失败")
@@ -97,6 +112,7 @@ class KryptonPlugin(Star):
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=-100)
     async def judge_group_participation(self, event):
         """通过可选 JEV 筛选普通群消息，复用原生主 Agent。"""
+        await self.contacts.observe(event)
         if await self.participation.consider(event):
             event.is_at_or_wake_command = True
             event.is_wake = True
@@ -107,14 +123,31 @@ class KryptonPlugin(Star):
         if event.get_extra("krypton_private_diagnostic", False):
             return
         self.participation.note_sent(event)
+        if event.get_extra("krypton_contact_delivery", False):
+            return
         try:
             await self.private_proactive.on_reply(event)
         except Exception:
             logger.exception("私聊沉默时间更新失败")
 
     async def terminate(self):
+        await self.contacts.close()
         await self.private_proactive.close()
         await self.participation.close()
+
+    @filter.on_agent_begin()
+    async def begin_contact(self, event, run_context):
+        """只为主动联系任务安装本轮发送适配，不修改全局工具。"""
+        await self.contacts.begin(event, run_context)
+
+    @filter.on_llm_tool_respond()
+    async def record_contact_tool_result(self, event, tool, tool_args, tool_result):
+        if tool.name == "send_message_to_user":
+            self.contacts.reconcile_history(event)
+
+    @filter.on_agent_done()
+    async def finish_contact(self, event, run_context, response):
+        await self.contacts.finish(event)
 
     @filter.on_llm_request()
     async def prepare_request(self, event, req):

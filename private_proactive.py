@@ -11,6 +11,7 @@ from astrbot.core.cron.events import CronMessageEvent
 from astrbot.core.db.po import CronJob
 from astrbot.core.platform.message_type import MessageType
 
+from .contact_tasks import contact_schedule
 from .tasks import task_metadata
 
 DEFAULT_GOAL = (
@@ -18,6 +19,7 @@ DEFAULT_GOAL = (
     "先用 future_task_plus 确认相关任务；如果已经有人安排则复用，不重复创建。"
     "结合人设与当前私聊上下文，自己决定下次何时联系对方、聊什么或办什么事，"
     "并实际调用 future_task_plus 创建未来任务，不要只口头说已安排，"
+    "主动联系使用 intent=contact，timing_reason 写明选这个时间的语境依据；执行前可用 get_contact_state 查看联系事实。"
     "也不要要求对方提醒你或替你创建任务。若对方明确要求停止主动联系，则遵守。"
     "必要时可先调用其他工具了解情况，本轮不必立即发送私聊消息。"
     "对方一直没有回复时，可以先查看群活动，再按需读取群聊现场；群活跃不代表对方在线。"
@@ -91,9 +93,13 @@ class PrivateProactive:
         manager = self.context.cron_manager
         for job in await manager.list_jobs("active_agent"):
             payload = job.payload or {}
+            metadata = task_metadata(payload)
             if session not in (
                 payload.get("session"),
-                task_metadata(payload).get("source_session"),
+                metadata.get("source_session"),
+                metadata.get("contact_session")
+                if metadata.get("intent") == "contact"
+                else None,
             ):
                 continue
             if job.status == "running":
@@ -328,7 +334,12 @@ class PrivateProactive:
                     "sender_id": state["sender_id"],
                     "origin": "tool",
                     "note": note,
-                    "krypton": {"private_bootstrap": True},
+                    "krypton": {
+                        "private_bootstrap": True,
+                        "intent": "contact",
+                        "contact_session": session,
+                        "managed_private": True,
+                    },
                 },
             )
         try:
@@ -402,9 +413,19 @@ class PrivateProactive:
                             "id": future.job_id,
                             "name": future.name,
                             "next_run": future_run.timestamp() if future_run else None,
+                            "intent": task_metadata(future.payload).get(
+                                "intent", "task"
+                            ),
+                            "timing_reason": task_metadata(future.payload).get(
+                                "timing_reason", ""
+                            ),
                         }
                         if future
                         else None,
+                        "contact": await self.contact_state.facts(session)
+                        if getattr(self, "contact_state", None)
+                        else None,
+                        "followup": await contact_schedule(self.context, session),
                     }
                 )
             return {
