@@ -1,0 +1,2 @@
+# AstrBot 已包含此依赖。
+aiohttp>=3.9

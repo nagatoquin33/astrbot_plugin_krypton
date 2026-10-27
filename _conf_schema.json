@@ -1,0 +1,72 @@
+{
+  "enable_jev": {
+    "description": "启用 JEV 群聊参与判断",
+    "type": "bool",
+    "default": false,
+    "hint": "对指定群的普通消息判断是否值得唤醒主 Agent 接话。默认关闭；不筛选 @、指令和未来任务。还需开启当前会话的原生主动型能力。"
+  },
+  "typesafe_api_key": {
+    "description": "TypeSafe API Key",
+    "type": "string",
+    "default": "",
+    "condition": {"enable_jev": true},
+    "hint": "仅用于 JEV 判断。启用后会将近期最多 10 条、每条最多 1000 字符的群消息摘要发给配置的服务。"
+  },
+  "typesafe_api_base_url": {
+    "description": "TypeSafe API 地址",
+    "type": "string",
+    "default": "https://api.typesafe.ai",
+    "condition": {"enable_jev": true},
+    "hint": "支持服务根地址、以 /v1 结尾的地址或完整 /v1/systemone 地址。遵守环境代理及 no_proxy。"
+  },
+  "typesafe_model_id": {
+    "description": "JEV 模型 ID",
+    "type": "string",
+    "default": "jev-latest",
+    "condition": {"enable_jev": true},
+    "hint": "可填写服务支持的其他模型 ID；留空使用 jev-latest。"
+  },
+  "jev_group_sessions": {
+    "description": "允许主动接话的群会话",
+    "type": "list",
+    "default": [],
+    "condition": {"enable_jev": true},
+    "hint": "填写完整群 UMO，如 qq:GroupMessage:123。空列表不启用任何群。OneBot 的基础群 UMO 覆盖该群的隔离会话；填写带成员前缀的完整 UMO 时仅匹配该会话。"
+  },
+  "jev_threshold": {
+    "description": "参与分数阈值",
+    "type": "float",
+    "default": 0.75,
+    "slider": {"min": 0.0, "max": 1.0, "step": 0.05},
+    "condition": {"enable_jev": true},
+    "hint": "分数达到阈值才唤醒主 Agent；主 Agent 继续使用当前群的人设、模型和工具。"
+  },
+  "jev_check_interval": {
+    "description": "JEV 最小检查间隔（秒）",
+    "type": "int",
+    "default": 30,
+    "condition": {"enable_jev": true},
+    "hint": "由新消息触发检查，同一物理群在间隔内不重复请求。不是后台轮询。"
+  },
+  "jev_wakeup_cooldown": {
+    "description": "主动接话冷却（秒）",
+    "type": "int",
+    "default": 300,
+    "condition": {"enable_jev": true},
+    "hint": "唤醒主 Agent 或正常回复后，同一物理群在冷却期间不再自动接话。"
+  },
+  "jev_timeout": {
+    "description": "JEV 请求超时（秒）",
+    "type": "int",
+    "default": 8,
+    "condition": {"enable_jev": true},
+    "hint": "范围 1–30 秒。失败时跳过本次主动接话，不影响正常聊天和未来任务。"
+  },
+  "jev_participation_hint": {
+    "description": "参与偏好",
+    "type": "text",
+    "default": "",
+    "condition": {"enable_jev": true},
+    "hint": "可填写感兴趣的话题、熟悉的称呼和自然接话的偏好。只提供给判断层，具体回复仍由主 Agent 决定。"
+  }
+}
