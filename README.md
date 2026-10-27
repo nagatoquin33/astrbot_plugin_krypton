@@ -1,5 +1,9 @@
 # 氪 · Krypton
 
+<p align="center">
+  <img src="logo.png" alt="氪 Krypton Logo" width="180">
+</p>
+
 当前版本：`v0.4.0` · [更新记录](CHANGELOG.md)
 
 查询 AstrBot 已知会话的真实 ID，按需读取目标近期消息，增强原生主动型能力中的跨会话未来任务，并提供可选的 JEV 群聊参与判断。独立插件，共用 AstrBot 的任务数据库、调度器和任务唤醒 Agent。
